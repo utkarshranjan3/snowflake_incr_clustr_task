@@ -1,0 +1,188 @@
+CREATE WAREHOUSE IF NOT EXISTS enterprise_wh WAREHOUSE_SIZE = 'X-SMALL';
+USE WAREHOUSE enterprise_wh;
+
+
+CREATE DATABASE IF NOT EXISTS uber_enterprise_db;
+CREATE SCHEMA IF NOT EXISTS uber_enterprise_db.bronze;
+CREATE SCHEMA IF NOT EXISTS uber_enterprise_db.silver;
+CREATE SCHEMA IF NOT EXISTS uber_enterprise_db.gold;
+
+
+
+CREATE OR REPLACE STORAGE INTEGRATION s3_uber_integration
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::081277287111:role/snowflake-role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://uber-etl-utk/raw_ride/');
+
+
+DESC INTEGRATION s3_uber_integration;
+
+CREATE OR REPLACE STAGE uber_enterprise_db.bronze.s3_uber_stage
+  STORAGE_INTEGRATION = s3_uber_integration
+  URL = 's3://uber-etl-utk/raw_ride/'
+  FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = TRUE);
+
+
+CREATE OR REPLACE TABLE uber_enterprise_db.bronze.raw_uber_rides (
+    raw_payload VARIANT,
+    file_name STRING,
+    file_row_number INT,
+    ingested_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+-- Create Silver Table with Clustering Keys
+CREATE OR REPLACE TABLE uber_enterprise_db.silver.fct_rides_cleaned (
+    ride_id STRING,
+    rider_id STRING,
+    pickup_location STRING,
+    dropoff_location STRING,
+    fare_amount FLOAT,
+    distance_km FLOAT,
+    pickup_timestamp TIMESTAMP_NTZ,
+    pickup_date DATE,
+    trip_category STRING,
+    processed_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (pickup_date, pickup_location);
+
+CREATE OR REPLACE TABLE uber_enterprise_db.gold.agg_daily_location_metrics (
+    pickup_date DATE,
+    pickup_location STRING,
+    total_rides INT,
+    total_revenue FLOAT,
+    avg_fare FLOAT,
+    updated_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+CREATE OR REPLACE TASK uber_enterprise_db.bronze.t_load_bronze
+  WAREHOUSE = enterprise_wh
+  SCHEDULE = 'USING CRON 0 * * * * UTC'
+AS
+  COPY INTO uber_enterprise_db.bronze.raw_uber_rides (raw_payload, file_name, file_row_number)
+  FROM (
+      SELECT $1, METADATA$FILENAME, METADATA$FILE_ROW_NUMBER 
+      FROM @uber_enterprise_db.bronze.s3_uber_stage
+  )
+  ON_ERROR = 'SKIP_FILE';
+
+
+
+CREATE OR REPLACE TASK uber_enterprise_db.bronze.t_transform_silver
+  WAREHOUSE = enterprise_wh
+  AFTER uber_enterprise_db.bronze.t_load_bronze
+AS
+  INSERT INTO uber_enterprise_db.silver.fct_rides_cleaned (
+      ride_id, rider_id, pickup_location, dropoff_location, 
+      fare_amount, distance_km, pickup_timestamp, pickup_date, trip_category
+  )
+  SELECT 
+      raw_payload:ride_id::STRING AS ride_id,
+      raw_payload:rider_id::STRING AS rider_id,
+      raw_payload:pickup_location::STRING AS pickup_location,
+      raw_payload:dropoff_location::STRING AS dropoff_location,
+      raw_payload:fare_amount::FLOAT AS fare_amount,
+      raw_payload:distance_km::FLOAT AS distance_km,
+      raw_payload:timestamp::TIMESTAMP_NTZ AS pickup_timestamp,
+      CAST(raw_payload:timestamp AS DATE) AS pickup_date,
+      CASE 
+          WHEN raw_payload:distance_km::FLOAT < 5.0 THEN 'Short Trip'
+          WHEN raw_payload:distance_km::FLOAT BETWEEN 5.0 AND 15.0 THEN 'Medium Trip'
+          ELSE 'Long Trip'
+      END AS trip_category
+  FROM uber_enterprise_db.bronze.raw_uber_rides
+  WHERE ingested_at >= DATEADD(hour, -1, CURRENT_TIMESTAMP())
+    AND raw_payload:ride_id IS NOT NULL;
+
+
+
+CREATE OR REPLACE TASK uber_enterprise_db.bronze.t_load_gold
+  WAREHOUSE = enterprise_wh
+  AFTER uber_enterprise_db.bronze.t_transform_silver
+AS
+  MERGE INTO uber_enterprise_db.gold.agg_daily_location_metrics target
+  USING (
+      SELECT 
+          pickup_date,
+          pickup_location,
+          COUNT(ride_id) AS total_rides,
+          SUM(fare_amount) AS total_revenue,
+          AVG(fare_amount) AS avg_fare
+      FROM uber_enterprise_db.silver.fct_rides_cleaned
+      WHERE processed_at >= DATEADD(hour, -1, CURRENT_TIMESTAMP())
+      GROUP BY pickup_date, pickup_location
+  ) source
+  ON target.pickup_date = source.pickup_date AND target.pickup_location = source.pickup_location
+  WHEN MATCHED THEN
+      UPDATE SET target.total_rides = target.total_rides + source.total_rides,
+                 target.total_revenue = target.total_revenue + source.total_revenue,
+                 target.avg_fare = source.avg_fare,
+                 target.updated_at = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN
+      INSERT (pickup_date, pickup_location, total_rides, total_revenue, avg_fare, updated_at)
+      VALUES (source.pickup_date, source.pickup_location, source.total_rides, source.total_revenue, source.avg_fare, CURRENT_TIMESTAMP());
+
+
+
+ ALTER TASK uber_enterprise_db.bronze.t_load_gold RESUME; 
+
+ALTER TASK uber_enterprise_db.bronze.t_transform_silver RESUME;
+ALTER TASK uber_enterprise_db.bronze.t_load_bronze RESUME;
+
+
+-- Manually kick off the root task right now
+EXECUTE TASK uber_enterprise_db.bronze.t_load_bronze;
+
+
+
+SELECT *
+FROM TABLE(information_schema.task_history(
+    scheduled_time_range_start => DATEADD('hour', -1, CURRENT_TIMESTAMP()),
+    result_limit => 10
+))
+ORDER BY scheduled_time DESC;
+
+
+select * from uber_enterprise_db.bronze.raw_uber_rides;
+
+
+SELECT 
+    name, 
+    state, 
+    scheduled_time, 
+    completed_time, 
+    error_code, 
+    error_message
+FROM TABLE(information_schema.task_history(
+    scheduled_time_range_start => DATEADD('minute', -30, CURRENT_TIMESTAMP()),
+    result_limit => 10
+))
+ORDER BY scheduled_time DESC;
+
+
+ALTER TASK uber_enterprise_db.bronze.t_load_gold RESUME;
+ALTER TASK uber_enterprise_db.bronze.t_transform_silver RESUME;
+ALTER TASK uber_enterprise_db.bronze.t_load_bronze RESUME;
+
+
+ALTER WAREHOUSE enterprise_wh RESUME;
+
+
+EXECUTE TASK uber_enterprise_db.bronze.t_load_bronze;
+
+
+
+-- 1. Suspend the root task first
+ALTER TASK uber_enterprise_db.bronze.t_load_bronze SUSPEND;
+
+-- 2. Suspend the child task
+ALTER TASK uber_enterprise_db.bronze.t_transform_silver SUSPEND;
+
+-- 3. Suspend the grandchild task
+ALTER TASK uber_enterprise_db.bronze.t_load_gold SUSPEND;
+
+
+SHOW TASKS IN SCHEMA uber_enterprise_db.bronze;  
